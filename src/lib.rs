@@ -22,7 +22,7 @@ use lemmy_api_common::{
 use lemmy_apub::{VerifyUrlData, FEDERATION_HTTP_FETCH_LIMIT};
 use lemmy_db_schema::{
   source::secret::Secret,
-  utils::{build_db_pool, get_database_url, run_migrations},
+  utils::{run_migrations, DbPool},
 };
 use lemmy_routes::{feeds, images, nodeinfo, webfinger};
 use lemmy_utils::{
@@ -34,6 +34,7 @@ use reqwest::Client;
 use reqwest_middleware::ClientBuilder;
 use reqwest_tracing::TracingMiddleware;
 use std::{env, thread, time::Duration};
+use tokio::runtime::Handle;
 use tracing::subscriber::set_global_default;
 use tracing_actix_web::TracingLogger;
 use tracing_error::ErrorLayer;
@@ -45,7 +46,7 @@ use url::Url;
 pub(crate) const REQWEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Placing the main function in lib.rs allows other crates to import it and embed Lemmy
-pub async fn start_lemmy_server() -> Result<(), LemmyError> {
+pub async fn start_lemmy_server(pool: DbPool) -> Result<(), LemmyError> {
   let args: Vec<String> = env::args().collect();
   if args.get(1) == Some(&"--print-config-docs".to_string()) {
     let fmt = Formatting {
@@ -66,11 +67,10 @@ pub async fn start_lemmy_server() -> Result<(), LemmyError> {
   let settings = SETTINGS.to_owned();
 
   // Run the DB migrations
-  let db_url = get_database_url(Some(&settings));
-  run_migrations(&db_url);
-
-  // Set up the connection pool
-  let pool = build_db_pool(&settings).await?;
+  {
+    let mut db_conn = pool.get().await.unwrap();
+    run_migrations(&mut db_conn).await;
+  }
 
   // Run the Code-required migrations
   run_advanced_migrations(&pool, &settings).await?;
@@ -120,9 +120,13 @@ pub async fn start_lemmy_server() -> Result<(), LemmyError> {
     .build();
 
   // Schedules various cleanup tasks for the DB
-  thread::spawn(move || {
-    scheduled_tasks::setup(db_url, user_agent).expect("Couldn't set up scheduled_tasks");
-  });
+  {
+    let handle = Handle::current();
+    let pool = pool.clone();
+    thread::spawn(move || {
+      scheduled_tasks::setup(handle, pool, user_agent).expect("Couldn't set up scheduled_tasks");
+    });
+  }
 
   // Create Http server with websocket support
   let settings_bind = settings.clone();

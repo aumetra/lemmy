@@ -14,7 +14,7 @@ extern crate diesel_derive_enum;
 // this is used in tests
 #[cfg(feature = "full")]
 #[macro_use]
-extern crate diesel_migrations;
+extern crate diesel_migrations_async;
 
 #[cfg(feature = "full")]
 #[macro_use]

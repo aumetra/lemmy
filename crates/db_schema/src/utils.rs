@@ -1,6 +1,5 @@
 use crate::{
-  diesel::Connection,
-  diesel_migrations::MigrationHarness,
+  diesel_migrations_async::MigrationHarness,
   newtypes::DbUrl,
   CommentSortType,
   SortType,
@@ -15,7 +14,6 @@ use diesel::{
   result::{Error as DieselError, Error::QueryBuilderError},
   serialize::{Output, ToSql},
   sql_types::Text,
-  PgConnection,
 };
 use diesel_async::{
   pg::AsyncPgConnection,
@@ -24,7 +22,7 @@ use diesel_async::{
     AsyncDieselConnectionManager,
   },
 };
-use diesel_migrations::EmbeddedMigrations;
+use diesel_migrations_async::EmbeddedMigrations;
 use lemmy_utils::{error::LemmyError, settings::structs::Settings};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -147,7 +145,8 @@ async fn build_db_pool_settings_opt(settings: Option<&Settings>) -> Result<DbPoo
 
   // If there's no settings, that means its a unit test, and migrations need to be run
   if settings.is_none() {
-    run_migrations(&db_url);
+    let mut db_conn = pool.get().await?;
+    run_migrations(&mut db_conn).await;
   }
 
   Ok(pool)
@@ -155,13 +154,11 @@ async fn build_db_pool_settings_opt(settings: Option<&Settings>) -> Result<DbPoo
 
 pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
-pub fn run_migrations(db_url: &str) {
-  // Needs to be a sync connection
-  let mut conn =
-    PgConnection::establish(db_url).unwrap_or_else(|e| panic!("Error connecting to {db_url}: {e}"));
+pub async fn run_migrations(conn: &mut AsyncPgConnection) {
   info!("Running Database migrations (This may take a long time)...");
-  let _ = &mut conn
+  let _ = conn
     .run_pending_migrations(MIGRATIONS)
+    .await
     .unwrap_or_else(|e| panic!("Couldn't run DB Migrations: {e}"));
   info!("Database migrations complete.");
 }

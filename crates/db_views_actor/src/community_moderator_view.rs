@@ -1,5 +1,5 @@
 use crate::structs::CommunityModeratorView;
-use diesel::{result::Error, ExpressionMethods, QueryDsl};
+use diesel::{query_dsl::methods::DistinctOnDsl, result::Error, ExpressionMethods, QueryDsl};
 use diesel_async::RunQueryDsl;
 use lemmy_db_schema::{
   newtypes::{CommunityId, PersonId},

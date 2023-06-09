@@ -1,12 +1,13 @@
 use clokwerk::{Scheduler, TimeUnits as CTimeUnits};
+use deadpool::managed::Manager;
+// Import week days and WeekDay
+use diesel::sql_query;
 use diesel::{
   dsl::{now, IntervalDsl},
-  Connection,
   ExpressionMethods,
   QueryDsl,
 };
-// Import week days and WeekDay
-use diesel::{sql_query, PgConnection, RunQueryDsl};
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use lemmy_db_schema::{
   schema::{
     activity,
@@ -18,51 +19,85 @@ use lemmy_db_schema::{
     post_aggregates,
   },
   source::instance::{Instance, InstanceForm},
-  utils::{functions::hot_rank, naive_now},
+  utils::{functions::hot_rank, naive_now, DbPool},
 };
 use lemmy_routes::nodeinfo::NodeInfo;
 use lemmy_utils::{error::LemmyError, REQWEST_TIMEOUT};
 use reqwest::blocking::Client;
 use std::{thread, time::Duration};
+use tokio::runtime::Handle;
 use tracing::info;
 
 /// Schedules various cleanup tasks for lemmy in a background thread
-pub fn setup(db_url: String, user_agent: String) -> Result<(), LemmyError> {
+pub fn setup(handle: Handle, db_pool: DbPool, user_agent: String) -> Result<(), LemmyError> {
+  let (mut conn_1, mut conn_2, mut conn_3, mut conn_4) = handle.block_on(async move {
+    // Probably don't wanna share the same connections
+    // We're just gonna produce four new ones real quick
+
+    let mut conn_1 = db_pool
+      .manager()
+      .create()
+      .await
+      .expect("could not establish connection");
+
+    let conn_2 = db_pool
+      .manager()
+      .create()
+      .await
+      .expect("could not establish connection");
+
+    let conn_3 = db_pool
+      .manager()
+      .create()
+      .await
+      .expect("could not establish connection");
+
+    let conn_4 = db_pool
+      .manager()
+      .create()
+      .await
+      .expect("could not establish connection");
+
+    // Run on startup
+    active_counts(&mut conn_1).await;
+    update_hot_ranks(&mut conn_1, false).await;
+    update_banned_when_expired(&mut conn_1).await;
+    clear_old_activities(&mut conn_1).await;
+
+    (conn_1, conn_2, conn_3, conn_4)
+  });
+
   // Setup the connections
   let mut scheduler = Scheduler::new();
 
-  let mut conn_1 = PgConnection::establish(&db_url).expect("could not establish connection");
-  let mut conn_2 = PgConnection::establish(&db_url).expect("could not establish connection");
-  let mut conn_3 = PgConnection::establish(&db_url).expect("could not establish connection");
-  let mut conn_4 = PgConnection::establish(&db_url).expect("could not establish connection");
-
-  // Run on startup
-  active_counts(&mut conn_1);
-  update_hot_ranks(&mut conn_1, false);
-  update_banned_when_expired(&mut conn_1);
-  clear_old_activities(&mut conn_1);
-
   // Update active counts every hour
   scheduler.every(CTimeUnits::hour(1)).run(move || {
-    active_counts(&mut conn_1);
-    update_banned_when_expired(&mut conn_1);
+    let handle = Handle::current();
+    handle.block_on(async {
+      active_counts(&mut conn_1).await;
+      update_banned_when_expired(&mut conn_1).await;
+    });
   });
 
   // Update hot ranks every 5 minutes
   scheduler.every(CTimeUnits::minutes(5)).run(move || {
-    update_hot_ranks(&mut conn_2, true);
+    let handle = Handle::current();
+    handle.block_on(update_hot_ranks(&mut conn_2, true));
   });
 
   // Clear old activities every week
   scheduler.every(CTimeUnits::weeks(1)).run(move || {
-    clear_old_activities(&mut conn_3);
+    let handle = Handle::current();
+    handle.block_on(clear_old_activities(&mut conn_3));
   });
 
   scheduler.every(CTimeUnits::days(1)).run(move || {
-    update_instance_software(&mut conn_4, &user_agent);
+    let handle = Handle::current();
+    handle.block_on(update_instance_software(&mut conn_4, &user_agent));
   });
 
   // Manually run the scheduler in an event loop
+  let _guard = handle.enter();
   loop {
     scheduler.run_pending();
     thread::sleep(Duration::from_millis(1000));
@@ -70,7 +105,7 @@ pub fn setup(db_url: String, user_agent: String) -> Result<(), LemmyError> {
 }
 
 /// Update the hot_rank columns for the aggregates tables
-fn update_hot_ranks(conn: &mut PgConnection, last_week_only: bool) {
+async fn update_hot_ranks(conn: &mut AsyncPgConnection, last_week_only: bool) {
   let mut post_update = diesel::update(post_aggregates::table).into_boxed();
   let mut comment_update = diesel::update(comment_aggregates::table).into_boxed();
   let mut community_update = diesel::update(community_aggregates::table).into_boxed();
@@ -96,6 +131,7 @@ fn update_hot_ranks(conn: &mut PgConnection, last_week_only: bool) {
       )),
     ))
     .execute(conn)
+    .await
     .expect("update post_aggregate hot_ranks");
 
   comment_update
@@ -104,6 +140,7 @@ fn update_hot_ranks(conn: &mut PgConnection, last_week_only: bool) {
       comment_aggregates::published,
     )))
     .execute(conn)
+    .await
     .expect("update comment_aggregate hot_ranks");
 
   community_update
@@ -112,21 +149,23 @@ fn update_hot_ranks(conn: &mut PgConnection, last_week_only: bool) {
       community_aggregates::published,
     )))
     .execute(conn)
+    .await
     .expect("update community_aggregate hot_ranks");
   info!("Done.");
 }
 
 /// Clear old activities (this table gets very large)
-fn clear_old_activities(conn: &mut PgConnection) {
+async fn clear_old_activities(conn: &mut AsyncPgConnection) {
   info!("Clearing old activities...");
   diesel::delete(activity::table.filter(activity::published.lt(now - 6.months())))
     .execute(conn)
+    .await
     .expect("clear old activities");
   info!("Done.");
 }
 
 /// Re-calculate the site and community active counts every 12 hours
-fn active_counts(conn: &mut PgConnection) {
+async fn active_counts(conn: &mut AsyncPgConnection) {
   info!("Updating active site and community aggregates ...");
 
   let intervals = vec![
@@ -143,11 +182,13 @@ fn active_counts(conn: &mut PgConnection) {
     );
     sql_query(update_site_stmt)
       .execute(conn)
+      .await
       .expect("update site stats");
 
     let update_community_stmt = format!("update community_aggregates ca set users_active_{} = mv.count_ from community_aggregates_activity('{}') mv where ca.community_id = mv.community_id_", i.1, i.0);
     sql_query(update_community_stmt)
       .execute(conn)
+      .await
       .expect("update community stats");
   }
 
@@ -155,7 +196,7 @@ fn active_counts(conn: &mut PgConnection) {
 }
 
 /// Set banned to false after ban expires
-fn update_banned_when_expired(conn: &mut PgConnection) {
+async fn update_banned_when_expired(conn: &mut AsyncPgConnection) {
   info!("Updating banned column if it expires ...");
 
   diesel::update(
@@ -165,15 +206,17 @@ fn update_banned_when_expired(conn: &mut PgConnection) {
   )
   .set(person::banned.eq(false))
   .execute(conn)
+  .await
   .expect("update person.banned when expires");
 
   diesel::delete(community_person_ban::table.filter(community_person_ban::expires.lt(now)))
     .execute(conn)
+    .await
     .expect("remove community_ban expired rows");
 }
 
 /// Updates the instance software and version
-fn update_instance_software(conn: &mut PgConnection, user_agent: &str) {
+async fn update_instance_software(conn: &mut AsyncPgConnection, user_agent: &str) {
   info!("Updating instances software and versions...");
 
   let client = Client::builder()
@@ -184,6 +227,7 @@ fn update_instance_software(conn: &mut PgConnection, user_agent: &str) {
 
   let instances = instance::table
     .get_results::<Instance>(conn)
+    .await
     .expect("no instances found");
 
   for instance in instances {
@@ -208,6 +252,7 @@ fn update_instance_software(conn: &mut PgConnection, user_agent: &str) {
       diesel::update(instance::table.find(instance.id))
         .set(form)
         .execute(conn)
+        .await
         .expect("update site instance software");
     }
   }
