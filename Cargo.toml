@@ -160,4 +160,5 @@ actix-cors = "0.6.4"
 deadpool = "0.9.5"
 
 [patch.crates-io]
+diesel = { git = "https://github.com/aumetra/diesel.git", rev = "721ec81e10981b3cc7076e2d73812b5c54bf4fa3" }
 diesel_ltree = { git = "https://github.com/aumetra/diesel_ltree.git", rev = "cc500303cd6e4ae505051b906f6c762284a20c72" }
